@@ -336,6 +336,47 @@ secret = {
 }
 ```
 
+## HTTPS_PROXY clients
+
+Clients that only speak `HTTPS_PROXY` send `CONNECT` and then TLS, rather than plain HTTP to tokenizer. Tokenizer refuses `CONNECT` unless it's given a CA to terminate those tunnels with:
+
+```shell
+CONNECT_CA_CERT=ca.crt CONNECT_CA_KEY=ca.key tokenizer serve
+```
+
+Clients must trust `ca.crt`. Prefer an ECDSA CA, since a leaf certificate is generated for every tunnel. Each request in a tunnel must name the `CONNECT` target in its `Host` header, and is validated against and sent to that target only. Websocket upgrades aren't supported in tunnels.
+
+Put the bearer auth in the proxy URL, which clients send as `Proxy-Authorization`:
+
+```shell
+HTTPS_PROXY=http://x:trustno1@tokenizer:8080
+```
+
+The sealed secret can be sent in a `Proxy-Tokenizer` header on the `CONNECT` or inside the tunnel. Clients that can't set custom headers can send it in place of their usual credential, in `Authorization` or `X-Api-Key`, marked with a `tkz1:` prefix:
+
+```shell
+export ANTHROPIC_API_KEY="tkz1:$SEALED_SECRET"   # X-Api-Key: tkz1:...
+export GH_TOKEN="tkz1:$SEALED_SECRET"            # Authorization: token tkz1:...
+```
+
+A header carrying a marked secret is removed before the secret's processor runs, and a marked value that fails to unseal is an error. Unmarked values are left alone. Secrets sent this way take no request-time parameters, so seal them with the `dst` and `fmt` they need:
+
+```ruby
+secret = {
+    inject_processor: {
+        token: "my-anthropic-api-key",
+        dst: "X-Api-Key",
+        fmt: "%s"
+    },
+    bearer_auth: {
+        digest: Digest::SHA256.base64digest('trustno1')
+    },
+    allowed_hosts: ["api.anthropic.com"]
+}
+```
+
+Clients send `Authorization` and `X-Api-Key` straight to the origin when they don't use the proxy (because of `NO_PROXY` or a redirect, say), so expect sealed secrets sent this way to leak more often than `Proxy-Tokenizer`. Always seal them with an auth config, which leaked sealed secrets can't be used without.
+
 ## Production deployment — fly.io
 
 Assuming you have [flyctl](https://fly.io/docs/hands-on/install-flyctl/) installed, start by cloning this repository
@@ -405,3 +446,4 @@ Tokenizer is configured with the following environment variables:
 - `LISTEN_ADDRESS` - The address (`ip:port`) to listen on.
 - `FILTERED_HEADERS` - A comma separated list of request headers to strip from client requests.
 - `OPEN_PROXY` - Setting `1` or `true` will allow requests that don't contain sealed secrets to be proxied. Such requests are blocked by default.
+- `CONNECT_CA_CERT`, `CONNECT_CA_KEY` - PEM CA certificate and key. Setting both enables `CONNECT` for [HTTPS_PROXY clients](#https_proxy-clients).

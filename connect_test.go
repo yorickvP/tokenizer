@@ -25,11 +25,7 @@ import (
 )
 
 func TestConnectMITM(t *testing.T) {
-	// httptest servers share a certificate, so trusting it here would leak
-	// into other tests.
-	origTrust := UpstreamTrust
-	UpstreamTrust = origTrust.Clone()
-	t.Cleanup(func() { UpstreamTrust = origTrust })
+	isolateUpstreamTrust(t)
 
 	appServer := httptest.NewTLSServer(echo)
 	defer appServer.Close()
@@ -83,6 +79,20 @@ func TestConnectMITM(t *testing.T) {
 				Body:    "",
 			}, doEcho(t, client, req))
 		}
+	})
+
+	t.Run("HTTPS_PROXY client, secret in Authorization", func(t *testing.T) {
+		client := &http.Client{Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+		}}
+		req, err := http.NewRequest(http.MethodPost, "https://"+appHost+"/foo", nil)
+		assert.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer tkz1:"+secret)
+		assert.Equal(t, &echoResponse{
+			Headers: http.Header{"Authorization": {"Bearer " + token}},
+			Body:    "",
+		}, doEcho(t, client, req))
 	})
 
 	t.Run("HTTPS_PROXY client, secret inside tunnel", func(t *testing.T) {
@@ -190,6 +200,16 @@ func TestConnectMITM(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		assert.Contains(t, string(body), "dialing loopback address")
 	})
+}
+
+// isolateUpstreamTrust lets a test add to UpstreamTrust without affecting
+// other tests. httptest servers share a certificate, so trusting one trusts
+// them all.
+func isolateUpstreamTrust(t *testing.T) {
+	t.Helper()
+	orig := UpstreamTrust
+	UpstreamTrust = orig.Clone()
+	t.Cleanup(func() { UpstreamTrust = orig })
 }
 
 func testCA(t *testing.T) (tls.Certificate, *x509.CertPool) {

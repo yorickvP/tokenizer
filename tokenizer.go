@@ -43,6 +43,17 @@ func init() {
 
 const headerProxyTokenizer = "Proxy-Tokenizer"
 
+// sealedPrefix marks a sealed secret sent in one of SealedHeaders, in place of
+// the credential a client would normally send there.
+const sealedPrefix = "tkz1:"
+
+// SealedHeaders are origin headers checked for sealed secrets marked with
+// sealedPrefix, for clients that can't set Proxy-Tokenizer. A value may have
+// an auth scheme before the marked secret, e.g. "Bearer tkz1:...". Secrets sent
+// this way take no request-time parameters, and a header carrying one is
+// removed before processors run.
+var SealedHeaders = []string{"Authorization", "X-Api-Key"}
+
 type tokenizer struct {
 	*goproxy.ProxyHttpServer
 
@@ -524,8 +535,9 @@ func (t *tokenizer) OpenSealed(b64Secret string) ([]byte, error) {
 
 func (t *tokenizer) processorsFromRequest(req *http.Request) (*processorsResult, error) {
 	hdrs := req.Header[headerProxyTokenizer]
+	sealed := takeSealedHeaders(req)
 	result := &processorsResult{
-		request: make([]RequestProcessor, 0, len(hdrs)),
+		request: make([]RequestProcessor, 0, len(hdrs)+len(sealed)),
 	}
 
 	for _, hdr := range hdrs {
@@ -533,57 +545,97 @@ func (t *tokenizer) processorsFromRequest(req *http.Request) (*processorsResult,
 		if err != nil {
 			return result, err
 		}
-
-		jsonSecret, err := t.OpenSealed(b64Secret)
-		if err != nil {
+		if err := t.addSecret(result, req, b64Secret, params); err != nil {
 			return result, err
 		}
+	}
 
-		secret := new(Secret)
-		if err = json.Unmarshal(jsonSecret, secret); err != nil {
-			return result, fmt.Errorf("bad secret json: %w", err)
-		}
-
-		// capture secret and params for logger
-		safeSecret := secret.StripHazmatString()
-		pstr, _ := json.Marshal(params)
-		result.safeSecrets = append(result.safeSecrets, loggerSecret{safeSecret, string(pstr)})
-
-		if err = secret.AuthRequest(t, req); err != nil {
-			return result, fmt.Errorf("unauthorized to use secret: %w", err)
-		}
-
-		for _, v := range secret.RequestValidators {
-			if err := v.Validate(req); err != nil {
-				return result, fmt.Errorf("request validator failed: %w", err)
-			}
-		}
-
-		sealCtx := &SealingContext{
-			AuthConfig:        secret.AuthConfig,
-			RequestValidators: secret.RequestValidators,
-			SealKey:           t.pub,
-		}
-
-		processor, err := secret.Processor(params, sealCtx)
-		if err != nil {
+	for _, b64Secret := range sealed {
+		// No params, so dst and fmt come from the secret alone.
+		if err := t.addSecret(result, req, b64Secret, map[string]string{}); err != nil {
 			return result, err
-		}
-		result.request = append(result.request, processor)
-
-		// Check if the processor also handles responses
-		if rpc, ok := secret.ProcessorConfig.(ResponseProcessorConfig); ok {
-			respProc, err := rpc.ResponseProcessor(params, sealCtx)
-			if err != nil {
-				return result, err
-			}
-			if respProc != nil {
-				result.response = append(result.response, respProc)
-			}
 		}
 	}
 
 	return result, nil
+}
+
+// takeSealedHeaders removes the SealedHeaders that carry a marked sealed secret
+// from req and returns the secrets, so they never reach the upstream.
+func takeSealedHeaders(req *http.Request) []string {
+	var secrets []string
+	for _, h := range SealedHeaders {
+		var found bool
+		for _, v := range req.Header.Values(h) {
+			v = strings.TrimSpace(v)
+			if !strings.HasPrefix(v, sealedPrefix) {
+				_, v, _ = strings.Cut(v, " ")
+				v = strings.TrimSpace(v)
+			}
+			if b64Secret, ok := strings.CutPrefix(v, sealedPrefix); ok {
+				secrets = append(secrets, b64Secret)
+				found = true
+			}
+		}
+		if found {
+			req.Header.Del(h)
+		}
+	}
+	return secrets
+}
+
+// addSecret opens a sealed secret, checks that req may use it, and adds its
+// processors to result.
+func (t *tokenizer) addSecret(result *processorsResult, req *http.Request, b64Secret string, params map[string]string) error {
+	jsonSecret, err := t.OpenSealed(b64Secret)
+	if err != nil {
+		return err
+	}
+
+	secret := new(Secret)
+	if err = json.Unmarshal(jsonSecret, secret); err != nil {
+		return fmt.Errorf("bad secret json: %w", err)
+	}
+
+	// capture secret and params for logger
+	safeSecret := secret.StripHazmatString()
+	pstr, _ := json.Marshal(params)
+	result.safeSecrets = append(result.safeSecrets, loggerSecret{safeSecret, string(pstr)})
+
+	if err = secret.AuthRequest(t, req); err != nil {
+		return fmt.Errorf("unauthorized to use secret: %w", err)
+	}
+
+	for _, v := range secret.RequestValidators {
+		if err := v.Validate(req); err != nil {
+			return fmt.Errorf("request validator failed: %w", err)
+		}
+	}
+
+	sealCtx := &SealingContext{
+		AuthConfig:        secret.AuthConfig,
+		RequestValidators: secret.RequestValidators,
+		SealKey:           t.pub,
+	}
+
+	processor, err := secret.Processor(params, sealCtx)
+	if err != nil {
+		return err
+	}
+	result.request = append(result.request, processor)
+
+	// Check if the processor also handles responses
+	if rpc, ok := secret.ProcessorConfig.(ResponseProcessorConfig); ok {
+		respProc, err := rpc.ResponseProcessor(params, sealCtx)
+		if err != nil {
+			return err
+		}
+		if respProc != nil {
+			result.response = append(result.response, respProc)
+		}
+	}
+
+	return nil
 }
 
 func parseHeaderProxyTokenizer(hdr string) (string, map[string]string, error) {
