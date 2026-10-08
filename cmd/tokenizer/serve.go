@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,6 +33,11 @@ Environment:
     OPEN_PROXY       - If true, allow proxy to be used without any sealed secrets.
     USE_FLYSRC       - If true, use /.fly/fly-src.pub to process fly-src headers.
     REQUIRE_FLYSRC   - If true, reject requests that do not have a valid fly-src header.
+    CONNECT_CA_CERT  - PEM CA certificate. Together with CONNECT_CA_KEY, enables
+                       CONNECT for HTTPS_PROXY clients, which must trust this
+                       CA. Each tunneled request is pinned to the CONNECT target.
+    CONNECT_CA_KEY   - PEM private key for CONNECT_CA_CERT. Prefer ECDSA; leaf
+                       certificates are generated per connection.
     DEBUG            - If true, enables debug logging.
     DEBUG_TCP        - If true, enables debug logging of connections.
 `
@@ -47,6 +53,8 @@ func runServe(cmd string, args []string) {
 		openProxy     = fs.String("open-proxy", os.Getenv("OPEN_PROXY"), "run an open proxy if set to true or 1")
 		useFlysrc     = fs.String("use-flysrc", os.Getenv("USE_FLYSRC"), "support fly-src using /.fly/fly-src.pub if set to true or 1")
 		requireFlysrc = fs.String("require-flysrc", os.Getenv("REQUIRE_FLYSRC"), "require fly-src to use proxy if set to true or 1")
+		connectCACert = fs.String("connect-ca-cert", os.Getenv("CONNECT_CA_CERT"), "PEM CA certificate for terminating CONNECT tunnels")
+		connectCAKey  = fs.String("connect-ca-key", os.Getenv("CONNECT_CA_KEY"), "PEM private key for -connect-ca-cert")
 	)
 	parseFlags(fs, serveUsage, args)
 
@@ -76,6 +84,18 @@ func runServe(cmd string, args []string) {
 
 	if strToBool(*requireFlysrc) {
 		opts = append(opts, tokenizer.RequireFlySrc())
+	}
+
+	switch {
+	case *connectCACert != "" && *connectCAKey != "":
+		ca, err := tls.LoadX509KeyPair(*connectCACert, *connectCAKey)
+		if err != nil {
+			logrus.WithError(err).Fatal("load CONNECT CA")
+		}
+		opts = append(opts, tokenizer.ConnectMITM(ca))
+	case *connectCACert != "" || *connectCAKey != "":
+		fmt.Fprintf(os.Stderr, "CONNECT_CA_CERT and CONNECT_CA_KEY must be set together\n")
+		os.Exit(1)
 	}
 
 	if strToBool(*useFlysrc) {

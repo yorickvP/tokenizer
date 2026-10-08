@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -51,6 +52,11 @@ type tokenizer struct {
 	// RequireFlySrc will reject requests without a fly-src when set.
 	RequireFlySrc bool
 
+	// connectCA, if set, enables CONNECT for clients that only speak
+	// HTTPS_PROXY. Tunnels are TLS-terminated with leaf certificates signed by
+	// this CA and every tunneled request is pinned to the CONNECT target.
+	connectCA *tls.Certificate
+
 	// allowPrivateUpstreams disables the denial of private, loopback,
 	// unspecified, link-local, and fdaa::/8 upstream addresses. Only for tests.
 	allowPrivateUpstreams bool
@@ -78,6 +84,16 @@ type Option func(*tokenizer)
 func OpenProxy() Option {
 	return func(t *tokenizer) {
 		t.OpenProxy = true
+	}
+}
+
+// ConnectMITM enables CONNECT for clients that only speak HTTPS_PROXY. The
+// tunnel's TLS is terminated with certificates signed by ca, which clients must
+// trust. A tunneled request must name the CONNECT target in its Host header and
+// URL. It's validated against and sent to that target, never anything else.
+func ConnectMITM(ca tls.Certificate) Option {
+	return func(t *tokenizer) {
+		t.connectCA = &ca
 	}
 }
 
@@ -198,6 +214,14 @@ func NewTokenizer(openKey string, opts ...Option) *tokenizer {
 	proxy.OnRequest().HandleConnectFunc(tkz.HandleConnect)
 	proxy.OnRequest().DoFunc(tkz.HandleRequest)
 	proxy.OnResponse().DoFunc(tkz.HandleResponse)
+	// goproxy's TLS MITM loop reads resp.Request, which errorResponse leaves
+	// nil.
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		if resp != nil && resp.Request == nil {
+			resp.Request = ctx.Req
+		}
+		return resp
+	})
 
 	return tkz
 }
@@ -213,19 +237,114 @@ type proxyUserData struct {
 	// JWTProcessorConfig uses this to seal the access token.
 	responseProcessors []func(*http.Response) error
 
-	// start time of the current request.
+	// connectHost is the CONNECT target if this is a tunneled connection,
+	// lowercased and without the port if it's 443.
+	connectHost string
+
+	// connectHeader holds the CONNECT request's Proxy-Tokenizer and
+	// Proxy-Authorization headers, which apply to every tunneled request.
+	connectHeader http.Header
+
+	// start time of the current request. gets reset between requests within a
+	// tunneled connection.
 	requestStart time.Time
 	reqLog       logrus.FieldLogger
 }
 
-// HandleConnect implements goproxy.FuncHttpsHandler. CONNECT is refused:
-// request validators check the Host header, but a tunneled request is
-// delivered to whatever the CONNECT line named, so honoring CONNECT would let
-// a client use a host-scoped secret against a different host.
+// HandleConnect implements goproxy.FuncHttpsHandler. CONNECT is refused unless
+// ConnectMITM is set: request validators check the Host header, but a tunneled
+// request is delivered to whatever the CONNECT line named, so honoring CONNECT
+// without pinning each request to the CONNECT target (see pinToConnectTarget)
+// would let a client use a host-scoped secret against a different host.
 func (t *tokenizer) HandleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-	logrus.WithField("connect_host", host).WithFields(reqLogFields(ctx.Req)).Warn("CONNECT not supported")
-	ctx.Resp = errorResponse(ErrBadRequest)
-	return goproxy.RejectConnect, ""
+	logger := logrus.WithField("connect_host", host).WithFields(reqLogFields(ctx.Req))
+	if t.connectCA == nil {
+		logger.Warn("CONNECT not supported")
+		ctx.Resp = errorResponse(ErrBadRequest)
+		return goproxy.RejectConnect, ""
+	}
+
+	hostname, _, err := net.SplitHostPort(host)
+	if err != nil || hostname == "" {
+		logger.Warn("bad CONNECT host")
+		ctx.Resp = errorResponse(ErrBadRequest)
+		return goproxy.RejectConnect, ""
+	}
+	if slices.ContainsFunc(t.tokenizerHostnames, func(h string) bool { return strings.EqualFold(h, hostname) }) {
+		logger.Warn("circular request")
+		ctx.Resp = errorResponse(ErrBadRequest)
+		return goproxy.RejectConnect, ""
+	}
+
+	connectHeader := make(http.Header)
+	for _, h := range FilteredHeaders {
+		if vs := ctx.Req.Header.Values(h); len(vs) > 0 {
+			connectHeader[h] = vs
+		}
+	}
+
+	ctx.UserData = &proxyUserData{
+		connectHost:   canonicalHost(host),
+		connectHeader: connectHeader,
+	}
+
+	return &goproxy.ConnectAction{
+		Action:    goproxy.ConnectMitm,
+		TLSConfig: goproxy.TLSConfigFromCA(t.connectCA),
+	}, host
+}
+
+// pinToConnectTarget makes a request read from a CONNECT tunnel name the
+// CONNECT target in both req.Host, which request validators check, and
+// req.URL, which the transport dials. goproxy builds req.URL from the CONNECT
+// line but leaves req.Host as the client sent it, and an absolute-form request
+// line inside the tunnel can name any URL, so both must match the target.
+func pinToConnectTarget(req *http.Request, pud *proxyUserData) error {
+	// goproxy's MITM websocket path dials upstream itself, bypassing dialFunc
+	// and verifying no certificates.
+	if req.Header.Get("Upgrade") != "" {
+		return fmt.Errorf("%w: upgrade not supported in CONNECT tunnel", ErrBadRequest)
+	}
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("%w: %s URL in CONNECT tunnel", ErrBadRequest, req.URL.Scheme)
+	}
+
+	if canonicalHost(req.Host) != pud.connectHost || canonicalHost(req.URL.Host) != pud.connectHost {
+		return fmt.Errorf("%w: request for %s in CONNECT tunnel to %s", ErrBadRequest, req.Host, pud.connectHost)
+	}
+
+	req.Host = pud.connectHost
+	// dialFunc upgrades upstream connections to TLS.
+	req.URL.Scheme = "http"
+	req.URL.Host = pud.connectHost
+
+	for h, vs := range pud.connectHeader {
+		if len(req.Header.Values(h)) == 0 {
+			req.Header[h] = vs
+		}
+	}
+
+	return nil
+}
+
+// canonicalHost lowercases a host[:port] and drops the port if it's 443.
+func canonicalHost(host string) string {
+	return strings.ToLower(strings.TrimSuffix(host, ":443"))
+}
+
+// tunnelRoundTrip turns transport errors into responses for tunneled requests.
+// goproxy's MITM loop drops the client connection on error, which would leave
+// the client without a reason.
+func tunnelRoundTrip(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
+	resp, err := ctx.Proxy.Tr.RoundTrip(req)
+	if err != nil {
+		if pud, ok := ctx.UserData.(*proxyUserData); ok && pud.reqLog != nil {
+			pud.reqLog = pud.reqLog.WithError(err)
+		}
+		resp = errorResponse(err)
+		resp.Request = req
+	}
+	return resp, nil
 }
 
 func getSource(req *http.Request) string {
@@ -261,7 +380,23 @@ func (t *tokenizer) HandleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*ht
 	}
 
 	pud.requestStart = time.Now()
+	if req.URL == nil {
+		// goproxy's TLS MITM loop hands us a nil URL when it can't parse the
+		// request target, e.g. asterisk-form "OPTIONS *" inside the tunnel.
+		pud.reqLog = logrus.WithField("connect_host", pud.connectHost)
+		pud.reqLog.Warn("bad URL")
+		return nil, errorResponse(ErrBadRequest)
+	}
 	pud.reqLog = logrus.WithFields(reqLogFields(ctx.Req))
+
+	if pud.connectHost != "" {
+		pud.reqLog = pud.reqLog.WithField("connect_host", pud.connectHost)
+		if err := pinToConnectTarget(req, pud); err != nil {
+			pud.reqLog.WithError(err).Warn("tunneled request")
+			return nil, errorResponse(err)
+		}
+		ctx.RoundTripper = goproxy.RoundTripperFunc(tunnelRoundTrip)
+	}
 
 	if t.flysrcParser != nil {
 		src, err := t.flysrcParser.FromRequest(req)
@@ -345,7 +480,7 @@ func (t *tokenizer) HandleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *
 		}
 	}
 
-	// reset pud
+	// reset pud for next request in tunnel
 	pud.requestStart = time.Time{}
 	pud.reqLog = nil
 	pud.responseProcessors = nil
